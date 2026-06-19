@@ -236,3 +236,50 @@ If the fix didn't work:
 - **Proxy interference**: If behind a corporate proxy, `curl`'s connection to `127.0.0.1:7897`
   (Clash, mitmproxy) may succeed while the actual target is unreachable. Run
   `curl -v --noproxy '*' <url>` to bypass.
+- **Clash/mitmproxy intercepting localhost calls**: Tools like Clash, mitmproxy, or
+  Charles Proxy often set `http_proxy`/`https_proxy` env vars that redirect *all*
+  traffic — including connections to `127.0.0.1` and `localhost`. A `curl http://127.0.0.1:8080`
+  call meant for a local service may silently route through the proxy, hitting a different
+  process or failing with an unexpected response. **Diagnosis**: Compare `curl -v` output
+  (look for `Connected to 127.0.0.1:7897` instead of the expected address) and check
+  `echo $http_proxy $https_proxy`. **Fix**: Use `--noproxy '*'` to bypass the proxy.
+- **`--noproxy '*'` limitations**: The `--noproxy` flag works by matching the target
+  hostname against a comma-separated list of patterns. `--noproxy '*'` should bypass all
+  proxies, but some proxy configurations (notably mitmproxy in transparent mode, or
+  Docker-level `iptables` redirects) intercept traffic at a lower OSI layer that curl
+  cannot opt out of. **Diagnosis**: If `--noproxy '*'` still shows the proxy IP in
+  `Connected to ...`, try `unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY` in the
+  same shell, or use `curl --proxy "" <url>` to explicitly clear the proxy.
+- **Connection timeout vs. connection refused**: These two errors point to very different
+  root causes and must not be confused.
+
+  | Error | `curl` Signal | Meaning | Likely Cause |
+  |-------|--------------|---------|-------------|
+  | **Connection timeout** | `curl: (28) Connection timed out` | The OS sent a TCP SYN, waited N seconds, and never received a SYN-ACK. | Firewall dropping outbound packets; wrong IP/port; service not listening on that address; network routing issue. |
+  | **Connection refused** | `curl: (7) Failed to connect to ... Connection refused` | The TCP handshake reached the host, but the host sent back a RST (reset) because no process is listening on that port. | Service is down; port mismatch; service listening on different interface (e.g., `127.0.0.1` only but you're hitting the external IP). |
+
+  **How to diagnose each**:
+  - **Timeout**: Run `curl -v --connect-timeout 5 <url>` and watch for the stall. Use
+    `ping <host>` to check basic reachability. Use `mtr <host>` or `traceroute` to find
+    where packets are dropped. A timeout on the first hop usually points to a local
+    firewall (iptables, Windows Defender, VPN kill-switch).
+  - **Refused**: Run `curl -v <url>` — you'll see `TCP_NODELAY set` and then immediately
+    `Connection refused`, no delay. On the server, verify `ss -tlnp | grep <port>` or
+    `netstat -tlnp | grep <port>` shows the expected PID. A common pitfall: the service
+    binds to `127.0.0.1` only, but `curl` resolves the hostname to `::1` (IPv6 localhost)
+    or a public IP — use `curl -v http://127.0.0.1:<port>` to test explicitly.
+- **Example — bypass proxy for localhost diagnostics**:
+  ```bash
+  # Without bypass — may hit the proxy instead of local service
+  curl -v http://127.0.0.1:9090/api/health
+  
+  # With noproxy bypass — forces direct connection
+  curl -v --noproxy '*' http://127.0.0.1:9090/api/health
+  
+  # If noproxy still doesn't work, unset all proxy vars
+  unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY all_proxy ALL_PROXY
+  curl -v http://127.0.0.1:9090/api/health
+  
+  # Verify what proxy curl would use
+  echo "http_proxy=$http_proxy https_proxy=$https_proxy no_proxy=$no_proxy"
+  ```
